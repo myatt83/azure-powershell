@@ -43,6 +43,7 @@ parameters:
 variables:
   ArtifactsName: LiveTestArtifacts
   DataLocation: $(Pipeline.Workspace)/$(ArtifactsName)
+  SuppressAzurePowerShellBreakingChangeWarnings: true
 
 schedules:
 - cron: "0 19 * * *"
@@ -174,6 +175,7 @@ stages:
 - stage: Report
   displayName: Send Report
   dependsOn: Test
+  condition: or(eq(variables['Build.Reason'], 'Schedule'), eq(variables['Build.SourceBranch'], 'refs/heads/internal/release'))
   jobs:
   - job:
     displayName: Send Live Test Status Report

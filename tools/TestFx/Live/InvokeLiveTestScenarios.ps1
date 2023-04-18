@@ -38,64 +38,101 @@ $rsp = [runspacefactory]::CreateRunspacePool(1, [int]$env:NUMBER_OF_PROCESSORS +
 [void]$rsp.Open()
 
 $liveJobs = $liveScenarios | ForEach-Object {
+    $module = [regex]::match($_, "[\\|\/]src[\\|\/](?<ModuleName>[a-zA-Z]+)[\\|\/]").Groups["ModuleName"].Value
+
     $ps = [powershell]::Create()
     $ps.RunspacePool = $rsp
-    $ps.AddScript({
+    [void]$ps.AddScript({
         param (
+            [string] $Module,
             [string] $RunPlatform,
-            [string] $RepoLocation,
+            [string] $PowerShellLatest,
             [string] $DataLocation,
             [string] $LiveScenarioScript
         )
 
-        Write-Host "Run platform : $RunPlatform"
-        Write-Host "Repo location : $RepoLocation"
-        Write-Host "Data location : $DataLocation"
-        Write-Host "Live test script : $LiveScenarioScript"
-        $moduleName = [regex]::match($LiveScenarioScript, "[\\|\/]src[\\|\/](?<ModuleName>[a-zA-Z]+)[\\|\/]").Groups["ModuleName"].Value
+        Write-Output "##[section]Live test run for module `"$Module`""
+
         Import-Module "./tools/TestFx/Assert.ps1" -Force
-        Import-Module "./tools/TestFx/Live/LiveTestUtility.psd1" -ArgumentList $moduleName, $RunPlatform, $PowerShellLatest, $DataLocation -Force
+        Import-Module "./tools/TestFx/Live/LiveTestUtility.psd1" -ArgumentList $Module, $RunPlatform, $PowerShellLatest, $DataLocation -Force
         . $LiveScenarioScript
-    }).AddParameter("RunPlatform", $RunPlatform).AddParameter("PowerShellLatest", $PowerShellLatest).AddParameter("DataLocation", $DataLocation).AddParameter("LiveScenarioScript", $_) | Out-Null
+
+        Write-Output ""
+
+    }).AddParameter("Module", $module).AddParameter("RunPlatform", $RunPlatform).AddParameter("PowerShellLatest", $PowerShellLatest).AddParameter("DataLocation", $DataLocation).AddParameter("LiveScenarioScript", $_)
 
     [PSCustomObject]@{
         Id          = $ps.InstanceId
+        Name        = $module
         Instance    = $ps
         AsyncHandle = $ps.BeginInvoke()
-    } | Add-Member State -MemberType ScriptProperty -PassThru -Value {
-        $this.Instance.InvocationStateInfo.State
+    } | Add-Member State -MemberType ScriptProperty -Value {
+        $bFlags = "NonPublic", "Instance", "Static"
+        $worker = $this.Instance.GetType().GetField("_worker", $bFlags).GetValue($this.Instance)
+        $crp = $worker.GetType().GetProperty("CurrentlyRunningPipeline", $bFlags).GetValue($worker, $null)
+        if ($this.AsyncHandle.IsCompleted -and ![bool]$crp) {
+            "Completed"
+        }
+        elseif (!$this.AsyncHandle.IsCompleted -and [bool]$crp) {
+            "Running"
+        }
+        elseif (!$this.AsyncHandle.IsCompleted -and ![bool]$crp) {
+            "NotStarted"
+        }
+        else {
+            "Unknown"
+        }
     }
 }
 
-$totalJobs = $liveJobs
-while ($totalJobs.Count -gt 0) {
-    Start-Sleep -Seconds 10
+Start-Sleep -Seconds 300
+
+$totalJobsCount = $liveJobs.Count
+$queuedJobs = $liveJobs
+while ($queuedJobs.Count -gt 0) {
+    Start-Sleep -Seconds 60
+
+    $waitingJobs = @()
     $runningJobs = @()
     $completedJobs = @()
-    foreach ($job in $totalJobs) {
-        if ($job.State -match "Completed|Failed|Stopped|Suspended|Disconnected" -and $job.AsyncHandle.IsCompleted) {
-            $completedJobs += $job
-        }
-        else {
-            $runningJobs += $job
+    foreach ($job in $queuedJobs) {
+        switch ($job.State) {
+            "NotStarted" {
+                $waitingJobs += $job
+            }
+            "Running" {
+                $runningJobs += $job
+            }
+            "Completed" {
+                $completedJobs += $job
+            }
         }
     }
 
+    $completedJobsCount += $completedJobs.Count
     if ($completedJobs.Count -gt 0) {
         $completedJobs | ForEach-Object {
             if ($null -ne $_.Instance) {
                 $_.Instance.EndInvoke($_.AsyncHandle)
-                $_.Instance.Streams | Select-Object -Property @{ Name = "FullOutput"; Expression = { $_.Information, $_.Verbose, $_.Debug, $_.Warning, $_.Error } } | Select-Object -ExpandProperty FullOutput
+                $_.Instance.Streams | Select-Object -Property @{ Name = "FullOutput"; Expression = { $_.Debug, $_.Error } } | Select-Object -ExpandProperty FullOutput
                 $_.Instance.Dispose()
             }
         }
     }
 
-    Write-Host "Total jobs: $($totalJobs.Count)"
-    Write-Host "Running jobs: $($runningJobs.Count)"
-    Write-Host "Completed jobs: $($completedJobs.Count)"
+    $queuedJobs = $waitingJobs + $runningJobs
 
-    $totalJobs = $runningJobs
+    Write-Host "##[group]Progress of the live test jobs" -ForegroundColor Magenta
+
+    Write-Host "##[section]Total jobs: $totalJobsCount" -ForegroundColor Green
+    Write-Host "##[section]Waiting jobs: $($waitingJobs.Count)" -ForegroundColor Green
+    Write-Host "##[section]Running jobs: $($runningJobs.Count)" -ForegroundColor Green
+    Write-Host "##[section]Completed jobs: $completedJobsCount" -ForegroundColor Green
+    Write-Host "##[section]Available runspaces in the pool: $($rsp.AvailableRunspaces)" -ForegroundColor Green
+
+    $queuedJobs | Select-Object Id, Name, State
+
+    Write-Host "##[endgroup]" -ForegroundColor Magenta
 }
 
 $rsp.Dispose()
